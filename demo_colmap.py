@@ -42,6 +42,12 @@ from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Demo")
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
+    
+    # --- 新增/修改的参数 start ---
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the reconstruction results. If None, saves to scene_dir (will fail on Kaggle input).")
+    parser.add_argument("--model_path", type=str, default="/kaggle/input/vggt-input-laojun/model.pt", help="Path to the local model weights file")
+    # --- 新增/修改的参数 end ---
+
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
     ######### BA parameters #########
@@ -111,15 +117,54 @@ def demo_fn(args):
 
     # Run VGGT for camera and depth estimation
     model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    
+    # --- 修改部分：优先从本地 args.model_path 加载模型 ---
+    model_loaded = False
+    if hasattr(args, 'model_path') and args.model_path and os.path.exists(args.model_path):
+        try:
+            # 处理路径可能是目录也可能是文件的情况
+            load_path = args.model_path
+            if os.path.isdir(load_path):
+                # 如果是目录，尝试寻找 .pt 文件
+                pt_files = glob.glob(os.path.join(load_path, "*.pt"))
+                if pt_files:
+                    load_path = pt_files[0]
+            
+            if os.path.isfile(load_path):
+                print(f"Loading weights from local path: {load_path}")
+                # 使用 torch.load 加载本地权重
+                state_dict = torch.load(load_path, map_location="cpu")
+                model.load_state_dict(state_dict)
+                model_loaded = True
+            else:
+                print(f"Warning: Model path {args.model_path} provided but file not found.")
+        except Exception as e:
+            print(f"Error loading local model: {e}. Fallback to URL.")
+
+    if not model_loaded:
+        print("Downloading weights from HuggingFace...")
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    
+    # -----------------------------------------------
+
     model.eval()
     model = model.to(device)
     print(f"Model loaded")
 
     # Get image paths and preprocess them
-    image_dir = os.path.join(args.scene_dir, "images")
+    # Check if images are in scene_dir or scene_dir/images
+    if os.path.exists(os.path.join(args.scene_dir, "images")):
+        image_dir = os.path.join(args.scene_dir, "images")
+    else:
+        image_dir = args.scene_dir
+        
     image_path_list = glob.glob(os.path.join(image_dir, "*"))
+    # Filter for image extensions to avoid errors
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+    image_path_list = [p for p in image_path_list if os.path.splitext(p)[1].lower() in image_extensions]
+    image_path_list.sort() # Ensure consistent order
+
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
@@ -240,13 +285,21 @@ def demo_fn(args):
         shared_camera=shared_camera,
     )
 
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
+    # --- 修改部分：处理输出路径 ---
+    # 如果指定了 output_dir，则使用该路径；否则使用 scene_dir（如果 scene_dir 只读则会报错）
+    if hasattr(args, 'output_dir') and args.output_dir:
+        output_base = args.output_dir
+    else:
+        output_base = args.scene_dir
+    
+    print(f"Saving reconstruction to {output_base}/sparse")
+    sparse_reconstruction_dir = os.path.join(output_base, "sparse")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
     reconstruction.write(sparse_reconstruction_dir)
 
     # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(args.scene_dir, "sparse/points.ply"))
+    trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(sparse_reconstruction_dir, "points.ply"))
+    # ---------------------------
 
     return True
 
@@ -301,30 +354,88 @@ if __name__ == "__main__":
 # Work in Progress (WIP)
 
 """
-VGGT Runner Script
-=================
+VGGT Runner Script (Modified for Kaggle)
+=======================================
 
-A script to run the VGGT model for 3D reconstruction from image sequences.
+使用说明 (Usage Guide):
 
-Directory Structure
-------------------
-Input:
-    input_folder/
-    └── images/            # Source images for reconstruction
+在 Kaggle Notebook 中使用时，你既可以在命令行运行，也可以在 Notebook Cell 中直接调用。
+最方便的方法是直接定义一个参数类，如下所示：
 
-Output:
-    output_folder/
-    ├── images/
-    ├── sparse/           # Reconstruction results
-    │   ├── cameras.bin   # Camera parameters (COLMAP format)
-    │   ├── images.bin    # Pose for each image (COLMAP format)
-    │   ├── points3D.bin  # 3D points (COLMAP format)
-    │   └── points.ply    # Point cloud visualization file 
-    └── visuals/          # Visualization outputs TODO
+```python
+# 1. 定义参数 (模拟 argparse 的参数)
+class Args:
+    # 必须修改的路径
+    scene_dir = "/kaggle/input/your-dataset/scene_name"       # 输入图片路径 (只读)
+    output_dir = "/kaggle/working/output_scene_name"          # 输出结果路径 (可写)
+    model_path = "/kaggle/input/vggt-input-laojun/model.pt"   # 你的本地模型路径
+    
+    # 可选参数 (保持默认即可)
+    seed = 42
+    use_ba = False   # 是否使用 Bundle Adjustment
+    max_reproj_error = 8.0
+    shared_camera = False
+    camera_type = "SIMPLE_PINHOLE"
+    vis_thresh = 0.2
+    query_frame_num = 8
+    max_query_pts = 4096
+    fine_tracking = True
+    conf_thres_value = 5.0
+    
+    class Args:
+    # --- 基础设置 ---
+    seed = 42                       # 随机种子：固定这个数字可以保证每次运行结果一致（复现性）
+    
+    # --- 核心模式选择 ---
+    use_ba = False                  # 是否使用 Bundle Adjustment (光束法平差)：
+                                    # False = 前馈模式 (Feed-forward)。速度极快，直接输出预测结果。
+                                    # True  = 优化模式。速度慢，但会优化相机位姿和点云，精度更高。
 
-Key Features
------------
-• Dual-mode Support: Run reconstructions using either VGGT or VGGT+BA
-• Resolution Preservation: Maintains original image resolution in camera parameters and tracks
-• COLMAP Compatibility: Exports results in standard COLMAP sparse reconstruction format
+    # --- 优化模式参数 (当 use_ba = True 时生效) ---
+    max_reproj_error = 8.0          # 最大重投影误差 (像素)：
+                                    # 在优化过程中，如果一个3D点投影回图像的误差超过8像素，就会被认为是"坏点"并剔除。
+                                    # 调小(如 2.0)会让点云更干净但点数变少；调大(如 10.0)点数多但杂讯多。
+    
+    vis_thresh = 0.2                # 轨迹可见性阈值：
+                                    # 过滤掉置信度低于 0.2 的特征点轨迹（Track）。
+    
+    query_frame_num = 8             # 查询帧数：
+                                    # 在追踪特征点时，每一帧会参考前后多少帧来寻找匹配。
+                                    # 数值越大，匹配越鲁棒（能处理大动作），但显存消耗和计算时间显著增加。
+    
+    max_query_pts = 4096            # 最大查询点数：
+                                    # 每一帧最多处理多少个关键点。显存不够时可以调小这个值 (例如 2048)。
+    
+    fine_tracking = True            # 开启精细追踪：
+                                    # True = 使用更耗时的算法进行亚像素级别的点位修正，精度更高。
+    
+    # --- 前馈模式参数 (当 use_ba = False 时生效) ---
+    conf_thres_value = 5.0          # 深度置信度阈值：
+                                    # 模型输出的深度图包含置信度。只有置信度 > 5.0 的像素才会被转换成 3D 点。
+                                    # 调高此值可以减少空中的噪点，但可能会导致物体变稀疏。
+
+    # --- 相机模型设置 ---
+    shared_camera = False           # 是否共享相机参数：
+                                    # True  = 假设所有图片是用同一台相机、同一个焦距拍摄的（适合视频）。
+                                    # False = 假设每张图片可能有不同的焦距（适合网上的混合图片集）。
+    
+    camera_type = "SIMPLE_PINHOLE"  # 相机模型类型：
+                                    # "SIMPLE_PINHOLE": 只有 1 个焦距参数 (f)，光心 (cx, cy) 固定在图像中心。
+                                    # "PINHOLE": 包含焦距 (fx, fy) 和光心 (cx, cy)。
+
+# 2. 运行函数
+import torch
+import os
+
+# 确保输出目录存在 (虽然脚本里会创建，但为了安全可以先检查)
+if not os.path.exists(Args.output_dir):
+    os.makedirs(Args.output_dir)
+
+print(f"Start processing {Args.scene_dir}...")
+
+with torch.no_grad():
+    # 直接调用主函数，传入参数对象
+    demo_fn(Args())
+
+print(f"Done! Results saved to {Args.output_dir}")
 """
